@@ -7,8 +7,9 @@ This writes the same record contract for Grok from:
 - ~/.grok/sessions/**/updates.jsonl  (per-turn token usage)
 - https://cli-chat-proxy.grok.com/v1/billing?format=credits  (weekly pool)
 
-The agents panel watches ~/.local/state/omarchy/agents/usage/*.json and
-draws whatever appears there, so a grok.json is enough to get a tab.
+The agents panel discovers ~/.local/state/omarchy/agents/usage/*.json only
+when its own updater exits. A grok.json that appears after that scan stays
+invisible, and with no other agent producing numbers the bar icon hides.
 """
 
 from __future__ import annotations
@@ -20,16 +21,18 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Callable
 
 AGENT_ID = "grok"
 AGENT_NAME = "Grok"
+PLUGIN_CONFIG_ID = "io.github.dougfour.grok-usage"
 AUTH_HELP = "Run `grok login` to restore weekly usage limits."
 BILLING_ENDPOINT = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 PROBE_MIN_INTERVAL_SECONDS = 15
@@ -609,6 +612,92 @@ def clear_record() -> None:
   dest.unlink(missing_ok=True)
 
 
+def shell_config_path() -> Path:
+  config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+  return config_home / "omarchy" / "shell.json"
+
+
+def plugin_enabled(config_path: Path | None = None) -> bool:
+  """True when shell.json still loads this plugin.
+
+  Unreadable config fails open: a shell restart must not delete grok.json
+  just because the file could not be read while the process was exiting.
+  """
+  path = shell_config_path() if config_path is None else config_path
+  try:
+    raw = path.read_text(encoding="utf-8")
+  except OSError:
+    return True
+  try:
+    config = json.loads(raw)
+  except json.JSONDecodeError:
+    return True
+  if not isinstance(config, dict):
+    return True
+
+  disabled = config.get("disabledPlugins")
+  if isinstance(disabled, list) and PLUGIN_CONFIG_ID in disabled:
+    return False
+
+  def listed(entry: Any) -> bool:
+    return entry == PLUGIN_CONFIG_ID or (
+      isinstance(entry, dict) and entry.get("id") == PLUGIN_CONFIG_ID
+    )
+
+  plugins = config.get("plugins")
+  if isinstance(plugins, list) and any(listed(entry) for entry in plugins):
+    return True
+
+  bar = config.get("bar")
+  layout = bar.get("layout") if isinstance(bar, dict) else None
+  if isinstance(layout, dict):
+    for section in ("left", "center", "right"):
+      entries = layout.get(section)
+      if isinstance(entries, list) and any(listed(entry) for entry in entries):
+        return True
+  return False
+
+
+def clear_if_disabled(config_path: Path | None = None, dest: Path | None = None) -> bool:
+  """Drop grok.json only after the plugin itself has been turned off.
+
+  Omarchy update restarts the shell, which destroys this service even though
+  shell.json still enables it. Deleting the record on that path hides the
+  agents icon until the stock panel's next scan.
+  """
+  if plugin_enabled(config_path):
+    return False
+  target = usage_dir() / "grok.json" if dest is None else dest
+  target.unlink(missing_ok=True)
+  return True
+
+
+def publish_record(record: dict[str, Any], dest: Path, nudge: Callable[..., None]) -> bool:
+  """Write grok.json. Ask the panel to rescan only when the file is new.
+
+  An update of an existing file is already watched. A rescan on every write
+  would loop: refresh rewrites the stock records, which triggers another collect.
+  """
+  existed = dest.is_file()
+  write_json(dest, record)
+  if existed:
+    return False
+  nudge("rescan")
+  return True
+
+
+def request_panel_rescan(*_ignored: object) -> None:
+  try:
+    subprocess.Popen(
+      ["omarchy-shell", "-q", "omarchy.agents", "refresh"],
+      stdout=subprocess.DEVNULL,
+      stderr=subprocess.DEVNULL,
+      start_new_session=True,
+    )
+  except OSError:
+    return
+
+
 def main() -> int:
   parser = argparse.ArgumentParser()
   parser.add_argument("--force", action="store_true", help="rescan sessions and re-probe billing, ignoring caches")
@@ -616,15 +705,27 @@ def main() -> int:
   parser.add_argument("--cache-seconds", type=float, default=20)
   parser.add_argument("--write", action="store_true", help="write ~/.local/state/omarchy/agents/usage/grok.json")
   parser.add_argument("--clear", action="store_true", help="remove grok.json so the agents panel drops the Grok tab")
+  parser.add_argument(
+    "--clear-if-disabled",
+    action="store_true",
+    help="remove grok.json only when this plugin is no longer enabled",
+  )
   args = parser.parse_args()
+
+  if args.clear and args.clear_if_disabled:
+    parser.error("--clear and --clear-if-disabled are mutually exclusive")
 
   if args.clear:
     clear_record()
     return 0
 
+  if args.clear_if_disabled:
+    clear_if_disabled()
+    return 0
+
   record = build_record(args.force, args.limits_only, args.cache_seconds)
   if args.write:
-    write_json(usage_dir() / "grok.json", record)
+    publish_record(record, usage_dir() / "grok.json", request_panel_rescan)
   else:
     print(json.dumps(record, separators=(",", ":"), sort_keys=True))
   return 0

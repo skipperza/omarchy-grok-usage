@@ -11,14 +11,16 @@ Item {
   property var manifest: null
   property var shell: null
 
-  readonly property string pluginDir: manifest && manifest.__sourceDir ? String(manifest.__sourceDir) : ""
-  readonly property string collector: pluginDir + "/collect.py"
+  // Omarchy strips __sourceDir from third-party manifests, so a collector
+  // path built from that property never runs. Resolve collect.py from this
+  // QML file instead.
+  readonly property string collector: Qt.resolvedUrl("collect.py").toString().replace(/^file:\/\//, "")
   readonly property string home: Quickshell.env("HOME") || ""
   readonly property string stateHome: Quickshell.env("XDG_STATE_HOME") || (home + "/.local/state")
-  readonly property string claudeRecord: stateHome + "/omarchy/agents/usage/claude.json"
+  readonly property string fireworksRecord: stateHome + "/omarchy/agents/usage/fireworks.json"
 
   function collect(force) {
-    if (pluginDir === "" || collectProcess.running) return
+    if (collector === "" || collectProcess.running) return
     var cmd = ["python3", collector, "--write"]
     if (force === true) cmd.push("--force")
     collectProcess.command = cmd
@@ -26,8 +28,12 @@ Item {
   }
 
   function clearRecord() {
-    if (pluginDir === "") return
-    clearProcess.command = ["python3", collector, "--clear"]
+    if (collector === "") return
+    // A shell restart destroys this service while shell.json still enables
+    // it. --clear would delete grok.json before the new shell's only startup
+    // scan, and the agents icon then stays hidden. Delete only when the
+    // plugin was actually turned off.
+    clearProcess.command = ["python3", collector, "--clear-if-disabled"]
     clearProcess.running = true
   }
 
@@ -39,10 +45,10 @@ Item {
     onTriggered: root.collect(false)
   }
 
-  // Stock panel refresh rewrites claude.json. Use that as a cue so Grok
-  // updates when the user hits r, not only on this timer.
+  // Stock panel refresh rewrites bundled collectors' records, not grok.json.
+  // Watch fireworks.json so Grok updates when the user hits r in the panel.
   FileView {
-    path: root.claudeRecord
+    path: root.fireworksRecord
     watchChanges: true
     printErrors: false
     onFileChanged: root.collect(false)
