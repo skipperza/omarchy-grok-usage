@@ -2,7 +2,7 @@
 
 Adds **Grok** to Omarchy's **existing AI toolbar widget** — the AI icon already on the top bar. It does not add a second icon.
 
-After install, click that same AI button. You get a **Grok** chip next to **Claude Code** (and Codex / Fireworks if you use them): weekly SuperGrok pool, Grok Build vs Chat vs Imagine, and local token stats from `~/.grok/sessions`.
+After install, click that same AI button. You get a **Grok** chip next to **Claude Code** (and Codex / Fireworks if you use them): the weekly SuperGrok pool, Grok Build, Grok Bot, and local token stats from `~/.grok/sessions`.
 
 ![Grok inside Omarchy's existing AI toolbar widget](preview.png)
 
@@ -17,6 +17,7 @@ Requires:
 - Omarchy with the stock AI widget enabled (`omarchy.agents`, on by default)
 - Python 3 on `PATH` (stdlib only)
 - Grok Build signed in (`grok login`) so weekly limits can load
+- Grok Bot signed in so its weekly meter can load
 
 Leave the built-in AI icon where it is. After the first scan, click it and switch to **Grok**.
 
@@ -29,7 +30,7 @@ Leave the built-in AI icon where it is. After the first scan, click it and switc
 
 This plugin is a headless service. It only writes a Grok usage record for the stock panel to display.
 
-Weekly percent comes from `https://cli-chat-proxy.grok.com/v1/billing?format=credits` using the token in `~/.grok/auth.json`. Token charts come from `~/.grok/sessions/**/updates.jsonl`.
+Weekly and Grok Build percents come from `https://cli-chat-proxy.grok.com/v1/billing?format=credits` using the token in `~/.grok/auth.json`. The Grok Bot meter comes from that app's Cursor sand session. Token charts come from `~/.grok/sessions/**/updates.jsonl`.
 
 ## Remove
 
@@ -41,7 +42,7 @@ Removal deletes the plugin checkout and drops `~/.local/state/omarchy/agents/usa
 
 ## Privacy
 
-The collector reads local Grok session files and the saved Grok login, then calls xAI's billing endpoint. It never logs tokens. Expired tokens are not refreshed; run `grok login` (or start Grok) to renew them.
+The collector reads local Grok session files and the saved Grok login, then calls xAI's billing endpoint. The Grok Bot meter reads `~/.config/Grok Bot/sand-secrets.json`, decrypts that app's Cursor session with the "Grok Bot" keyring item, and calls Cursor's sand usage RPC. It never logs tokens. Expired Grok CLI tokens are not refreshed; run `grok login` (or start Grok) to renew them. A refreshed Grok Bot access token stays in memory and is not written back to the Grok Bot config.
 
 ## License
 
