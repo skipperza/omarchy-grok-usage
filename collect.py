@@ -5,7 +5,8 @@ Omarchy's stock updater only ships Claude, Codex, and Fireworks collectors.
 This writes the same record contract for Grok from:
 
 - ~/.grok/sessions/**/updates.jsonl  (per-turn token usage)
-- https://cli-chat-proxy.grok.com/v1/billing?format=credits  (weekly pool)
+- https://cli-chat-proxy.grok.com/v1/billing?format=credits  (weekly pool and Grok Build)
+- https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig  (Grok Chat and Grok Voice)
 - Grok Bot's Cursor sand session (weekly Grok Bot allowance)
 
 The agents panel discovers ~/.local/state/omarchy/agents/usage/*.json only
@@ -24,6 +25,7 @@ import json
 import os
 import re
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -42,12 +44,30 @@ AUTH_HELP = "Run `grok login` to restore weekly usage limits."
 BOT_AUTH_HELP = "Sign in to Grok Bot to show its weekly limit."
 BOT_UNREACHABLE_HELP = "Couldn't reach Grok Bot. Other Grok limits are still shown."
 BILLING_ENDPOINT = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+CREDITS_CONFIG_ENDPOINT = "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig"
+# Empty grpc-web data frame. Cloudflare 1010s urllib's default User-Agent.
+CREDITS_CONFIG_BODY = b"\x00\x00\x00\x00\x00"
+BROWSER_USER_AGENT = (
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+  "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 CURSOR_BACKEND = "https://api2.cursor.sh"
 SAND_USAGE_RPC = CURSOR_BACKEND + "/aiserver.v1.DashboardService/GetSandUsageStatus"
 CURSOR_TOKEN_URL = CURSOR_BACKEND + "/oauth/token"
 # Public Cursor installed-app OAuth client id, not a user secret.
 CURSOR_CLIENT_ID = "KbZUR41cY7W6zRSdpSUJ7I7mLYBKOCmB"
-USAGE_HOSTS = frozenset({"cli-chat-proxy.grok.com", "api2.cursor.sh"})
+USAGE_HOSTS = frozenset({"cli-chat-proxy.grok.com", "api2.cursor.sh", "grok.com"})
+CHAT_LABEL = "Grok Chat"
+VOICE_LABEL = "Grok Voice"
+# GetGrokCreditsConfig product enum. Do not remap.
+_CREDITS_ENUM_LABEL = {
+  1: "API",
+  2: "Grok Build",
+  3: "Other",
+  4: CHAT_LABEL,
+  5: "Imagine",
+  6: VOICE_LABEL,
+}
 PROBE_MIN_INTERVAL_SECONDS = 15
 MAX_AUTH_FILE_BYTES = 256 * 1024
 MAX_CACHE_FILE_BYTES = 1024 * 1024
@@ -554,22 +574,291 @@ def probe_limits(token: str) -> dict[str, Any]:
   if weekly >= 0:
     limits.append({"label": "Weekly", "title": "Weekly", "percent": weekly, "resetsAt": resets_at})
 
-  products = config.get("productUsage")
-  if isinstance(products, list):
-    for entry in products:
-      if not isinstance(entry, dict):
-        continue
-      percent = normalize_percent(entry.get("usagePercent"))
-      if percent < 0:
-        continue
-      name = product_label(entry.get("product"))
-      limits.append({"label": name, "title": name, "percent": percent, "resetsAt": resets_at})
+  product_rows = config.get("productUsage")
+  if not isinstance(product_rows, list):
+    product_rows = []
+  for entry in product_rows:
+    if not isinstance(entry, dict):
+      continue
+    percent = normalize_percent(entry.get("usagePercent"))
+    if percent < 0:
+      continue
+    name = product_label(entry.get("product"))
+    limits.append({"label": name, "title": name, "percent": percent, "resetsAt": resets_at})
+
+  try:
+    limits = limits_with_credits(
+      limits,
+      resets_at=resets_at,
+      rest_products=product_rows,
+      fetch=lambda: fetch_credits_config(safe),
+    )
+  except Exception:
+    pass
 
   if not limits:
     return {"ok": False, "helpText": "Grok billing returned no limits. Local Grok stats are still shown."}
 
   tier = str(config.get("subscriptionTier") or payload.get("subscriptionTier") or "").strip()
   return {"ok": True, "limits": limits, "tierLabel": tier}
+
+
+def fetch_credits_config(token: str) -> tuple[int, bytes]:
+  """POST the empty GetGrokCreditsConfig frame. Never follows a redirect."""
+  safe = _header_safe(token)
+  if safe is None:
+    return 401, b""
+  try:
+    return usage_request(
+      CREDITS_CONFIG_ENDPOINT,
+      method="POST",
+      headers={
+        "Content-Type": "application/grpc-web+proto",
+        "x-grpc-web": "1",
+        "Authorization": "Bearer " + safe,
+        "x-xai-token-auth": "xai-grok-cli",
+        "Origin": "https://grok.com",
+        "Referer": "https://grok.com/?_s=usage",
+        "User-Agent": BROWSER_USER_AGENT,
+      },
+      data=CREDITS_CONFIG_BODY,
+      timeout=15,
+    )
+  except urllib.error.HTTPError as error:
+    try:
+      read_limited_http_body(error, MAX_HTTP_BODY_BYTES)
+    except Exception:
+      pass
+    return int(error.code), b""
+  except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+    return -1, b""
+
+
+def _read_varint(buf: bytes, index: int) -> tuple[int, int]:
+  value = 0
+  shift = 0
+  for _ in range(10):
+    if index >= len(buf):
+      raise ValueError("truncated varint")
+    byte = buf[index]
+    index += 1
+    value |= (byte & 0x7F) << shift
+    if not byte & 0x80:
+      return value, index
+    shift += 7
+  raise ValueError("varint too long")
+
+
+def _iter_proto_fields(buf: bytes):
+  index = 0
+  size = len(buf)
+  while index < size:
+    tag, index = _read_varint(buf, index)
+    field, wire = tag >> 3, tag & 7
+    if field <= 0:
+      raise ValueError("invalid protobuf field")
+    if wire == 0:
+      value, index = _read_varint(buf, index)
+      yield field, wire, value
+    elif wire == 1:
+      if index + 8 > size:
+        raise ValueError("truncated fixed64")
+      yield field, wire, struct.unpack_from("<d", buf, index)[0]
+      index += 8
+    elif wire == 5:
+      if index + 4 > size:
+        raise ValueError("truncated fixed32")
+      yield field, wire, struct.unpack_from("<f", buf, index)[0]
+      index += 4
+    elif wire == 2:
+      length, index = _read_varint(buf, index)
+      if length < 0 or index + length > size:
+        raise ValueError("truncated bytes")
+      yield field, wire, buf[index:index + length]
+      index += length
+    else:
+      raise ValueError("unsupported protobuf wire type")
+
+
+def _decode_credit_product(buf: bytes) -> dict[str, Any] | None:
+  """One field-7 product. A missing field 2 is omitted, not paired with another float."""
+  enum = None
+  percent = None
+  for field, wire, value in _iter_proto_fields(buf):
+    if field == 1 and wire == 0 and enum is None:
+      enum = int(value)
+    elif field == 2 and wire in (1, 5) and percent is None:
+      number = float(value)
+      if number == number and number >= 0:
+        percent = number
+  if enum is None:
+    return None
+  return {"enum": enum, "percent": percent}
+
+
+def _products_in_message(buf: bytes, depth: int = 0) -> list[dict[str, Any]] | None:
+  """Field-7 products, unwrapping a single length-delimited config wrapper."""
+  if depth > 3:
+    return None
+  products: list[dict[str, Any]] = []
+  found = False
+  nested: list[bytes] = []
+  for field, wire, value in _iter_proto_fields(buf):
+    if field == 7 and wire == 2 and isinstance(value, bytes):
+      found = True
+      entry = _decode_credit_product(value)
+      if entry is not None:
+        products.append(entry)
+    elif field == 1 and wire == 2 and isinstance(value, bytes):
+      nested.append(value)
+  if found:
+    return products
+  for child in nested:
+    inner = _products_in_message(child, depth + 1)
+    if inner is not None:
+      return inner
+  return None
+
+
+def _grpc_web_products(body: bytes) -> list[dict[str, Any]] | None:
+  """Products from a successful grpc-web body, or None when the call failed."""
+  frames: list[tuple[int, bytes]] = []
+  index = 0
+  size = len(body)
+  while index + 5 <= size:
+    flag = body[index]
+    length = int.from_bytes(body[index + 1:index + 5], "big")
+    index += 5
+    if length < 0 or index + length > size:
+      return None
+    frames.append((flag, body[index:index + length]))
+    index += length
+  if index != size or not frames:
+    return None
+
+  status = None
+  message = None
+  for flag, chunk in frames:
+    if flag & 0x80:
+      text = chunk.decode("utf-8", "replace")
+      for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if line.lower().startswith("grpc-status:"):
+          raw = line.split(":", 1)[1].strip()
+          try:
+            status = int(raw)
+          except ValueError:
+            return None
+    elif flag & 0x01:
+      return None
+    elif message is None:
+      message = chunk
+  if status not in (None, 0) or message is None:
+    return None
+  try:
+    products = _products_in_message(message)
+  except ValueError:
+    return None
+  return [] if products is None else products
+
+
+def _rest_usage(products: Any, label: str) -> tuple[bool, float | None]:
+  """(listed, raw percent). An omitted usagePercent is listed with None."""
+  if not isinstance(products, list):
+    return False, None
+  for entry in products:
+    if not isinstance(entry, dict) or product_label(entry.get("product")) != label:
+      continue
+    raw = entry.get("usagePercent")
+    if raw is None or normalize_percent(raw) < 0:
+      return True, None
+    return True, float(raw)
+  return False, None
+
+
+def _explicit_fraction(raw: float | None) -> float | None:
+  if raw is None:
+    return None
+  percent = normalize_percent(raw)
+  return percent if percent >= 0 else None
+
+
+def _insert_meter(limits: list[dict[str, Any]], entry: dict[str, Any]) -> None:
+  for index, item in enumerate(limits):
+    if item.get("label") == "Grok Bot":
+      limits.insert(index, entry)
+      return
+  limits.append(entry)
+
+
+def _has_label(limits: list[dict[str, Any]], label: str) -> bool:
+  return any(item.get("label") == label for item in limits)
+
+
+def _first_product(products: list[dict[str, Any]] | None, enum: int) -> dict[str, Any] | None:
+  if not products:
+    return None
+  for entry in products:
+    if entry.get("enum") == enum:
+      return entry
+  return None
+
+
+def limits_with_credits(
+  limits: list[dict[str, Any]],
+  body: bytes | None = None,
+  *,
+  resets_at: str = "",
+  rest_products: list[Any] | None = None,
+  fetch: Callable[[], tuple[int, bytes]] | None = None,
+) -> list[dict[str, Any]]:
+  """Add Grok Chat and Grok Voice. A failed credits-config call leaves the other meters."""
+  if fetch is not None:
+    try:
+      status, raw = fetch()
+    except Exception:
+      status, raw = -1, b""
+    body = raw if status == 200 and isinstance(raw, (bytes, bytearray)) and raw else None
+
+  kept = [dict(entry) for entry in limits if isinstance(entry, dict)]
+  if not resets_at:
+    for entry in kept:
+      if entry.get("label") == "Weekly" and entry.get("resetsAt"):
+        resets_at = str(entry["resetsAt"])
+        break
+  resets_at = str(resets_at or "")
+  products = _grpc_web_products(body) if isinstance(body, (bytes, bytearray)) and body else None
+
+  if products is not None:
+    for enum in (1, 2, 3, 5):
+      label = _CREDITS_ENUM_LABEL[enum]
+      item = _first_product(products, enum)
+      fraction = _explicit_fraction(item.get("percent") if item else None)
+      if fraction is None or _has_label(kept, label):
+        continue
+      _insert_meter(kept, {"label": label, "title": label, "percent": fraction, "resetsAt": resets_at})
+
+  if not _has_label(kept, CHAT_LABEL):
+    listed, explicit = _rest_usage(rest_products, CHAT_LABEL)
+    grpc_chat = _first_product(products, 4)
+    fraction = None
+    if explicit is not None:
+      fraction = _explicit_fraction(explicit)
+    elif grpc_chat is not None and grpc_chat.get("percent") is not None:
+      fraction = _explicit_fraction(grpc_chat.get("percent"))
+    if fraction is None and (listed or grpc_chat is not None):
+      fraction = 0.0
+    if fraction is not None:
+      _insert_meter(kept, {"label": CHAT_LABEL, "title": CHAT_LABEL, "percent": fraction, "resetsAt": resets_at})
+
+  # Unused voice is omitted from a successful product mix. A failed call must not invent the meter.
+  if products is not None and not _has_label(kept, VOICE_LABEL):
+    grpc_voice = _first_product(products, 6)
+    fraction = _explicit_fraction(grpc_voice.get("percent") if grpc_voice else None)
+    if fraction is None:
+      fraction = 0.0
+    _insert_meter(kept, {"label": VOICE_LABEL, "title": VOICE_LABEL, "percent": fraction, "resetsAt": resets_at})
+
+  return kept
 
 
 # --------------------------------------------------------------- Grok Bot

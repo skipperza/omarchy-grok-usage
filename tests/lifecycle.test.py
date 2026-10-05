@@ -9,6 +9,7 @@ restart, leaves that scan with nothing to show, so the icon collapses.
 from __future__ import annotations
 
 import json
+import struct
 import sys
 import tempfile
 import unittest
@@ -240,6 +241,191 @@ class GrokBotLimit(unittest.TestCase):
 
     self.assertEqual([entry["label"] for entry in result["limits"]], ["Weekly", "Grok Build"])
     self.assertEqual(result["authHelpText"], "")
+
+
+def _varint(value: int) -> bytes:
+  out = bytearray()
+  while True:
+    byte = value & 0x7F
+    value >>= 7
+    if value:
+      out.append(byte | 0x80)
+    else:
+      out.append(byte)
+      return bytes(out)
+
+
+def _proto_key(field: int, wire: int) -> bytes:
+  return _varint((field << 3) | wire)
+
+
+def _proto_varint_field(field: int, value: int) -> bytes:
+  return _proto_key(field, 0) + _varint(value)
+
+
+def _proto_float_field(field: int, value: float) -> bytes:
+  return _proto_key(field, 5) + struct.pack("<f", value)
+
+
+def _proto_len_field(field: int, payload: bytes) -> bytes:
+  return _proto_key(field, 2) + _varint(len(payload)) + payload
+
+
+def _product_field(enum: int, percent: float | None = None) -> bytes:
+  body = _proto_varint_field(1, enum)
+  if percent is not None:
+    body += _proto_float_field(2, percent)
+  return _proto_len_field(7, body)
+
+
+def _config_message(*products: bytes, weekly: float | None = None) -> bytes:
+  body = b""
+  if weekly is not None:
+    body += _proto_float_field(1, weekly)
+  return body + b"".join(products)
+
+
+def _grpc_frame(message: bytes, *, status: str | None = "0", wrap: bool = False) -> bytes:
+  if wrap:
+    message = _proto_len_field(1, message)
+  frame = b"\x00" + len(message).to_bytes(4, "big") + message
+  if status is None:
+    return frame
+  trailer = f"grpc-status:{status}\r\n".encode()
+  return frame + b"\x80" + len(trailer).to_bytes(4, "big") + trailer
+
+
+# Captured GetGrokCreditsConfig frame: weekly float 19, enum 2 float 19, enum 4
+# with no percent field, no enum 6. No credentials.
+LIVE_CREDITS_FRAME = bytes.fromhex(
+  "000000005a0a580d0000984112001a00220c0898e889d60610e0c5d9d903"
+  "2a0c0898ddaed60610e0c5d9d9033a07080215000098413a020804"
+  "421e0802120c0898e889d60610e0c5d9d9031a0c0898ddaed60610e0c5d9d903"
+  "580162006801800000000f677270632d7374617475733a300d0a"
+)
+
+
+class ChatVoiceLimits(unittest.TestCase):
+  def test_enum_4_without_percent_is_grok_chat_at_zero(self) -> None:
+    # Weekly float and a later product float must not be zipped onto Chat.
+    frame = _grpc_frame(
+      _config_message(_product_field(4), _product_field(2, 19.0), weekly=19.0),
+      wrap=True,
+    )
+    limits = collect.limits_with_credits(CLI_LIMITS, frame)
+    chat = [entry for entry in limits if entry["label"] == "Grok Chat"]
+
+    self.assertEqual(len(chat), 1)
+    self.assertEqual(chat[0]["title"], "Grok Chat")
+    self.assertEqual(chat[0]["percent"], 0.0)
+    self.assertEqual(chat[0]["resetsAt"], CLI_LIMITS[0]["resetsAt"])
+    self.assertEqual(next(entry["percent"] for entry in limits if entry["label"] == "Grok Build"), 0.17)
+    self.assertNotIn("Imagine", [entry["label"] for entry in limits])
+
+  def test_live_frame_maps_omitted_chat_percent_to_zero(self) -> None:
+    limits = collect.limits_with_credits(CLI_LIMITS, LIVE_CREDITS_FRAME)
+    labels = [entry["label"] for entry in limits]
+
+    self.assertEqual(labels, ["Weekly", "Grok Build", "Grok Chat", "Grok Voice"])
+    self.assertEqual(next(entry["percent"] for entry in limits if entry["label"] == "Grok Chat"), 0.0)
+    self.assertEqual(next(entry["percent"] for entry in limits if entry["label"] == "Grok Build"), 0.17)
+    self.assertEqual(next(entry["percent"] for entry in limits if entry["label"] == "Grok Voice"), 0.0)
+    self.assertEqual(
+      next(entry["resetsAt"] for entry in limits if entry["label"] == "Grok Voice"),
+      CLI_LIMITS[0]["resetsAt"],
+    )
+
+  def test_enum_6_with_percent_is_grok_voice(self) -> None:
+    frame = _grpc_frame(_config_message(_product_field(6, 12.5)))
+    limits = collect.limits_with_credits(CLI_LIMITS, frame)
+    voice = [entry for entry in limits if entry["label"] == "Grok Voice"]
+
+    self.assertEqual(len(voice), 1)
+    self.assertEqual(voice[0]["title"], "Grok Voice")
+    self.assertAlmostEqual(voice[0]["percent"], 0.125)
+    self.assertEqual(voice[0]["resetsAt"], CLI_LIMITS[0]["resetsAt"])
+
+  def test_failed_grpc_call_keeps_grok_build_and_does_not_invent_voice(self) -> None:
+    frame = _grpc_frame(
+      _config_message(_product_field(6, 40.0), _product_field(4)),
+      status="14",
+    )
+
+    def fetch() -> tuple[int, bytes]:
+      raise OSError("credits config unreachable")
+
+    from_fetch = collect.limits_with_credits(CLI_LIMITS, fetch=fetch)
+    from_status = collect.limits_with_credits(CLI_LIMITS, frame)
+
+    for limits in (from_fetch, from_status):
+      self.assertEqual([entry["label"] for entry in limits], ["Weekly", "Grok Build"])
+      self.assertEqual(limits[1]["percent"], 0.17)
+      self.assertEqual(limits[1]["title"], "Grok Build")
+
+  def test_explicit_rest_chat_percent_is_not_replaced_with_zero(self) -> None:
+    limits = CLI_LIMITS + [{
+      "label": "Grok Chat",
+      "title": "Grok Chat",
+      "percent": 0.42,
+      "resetsAt": "2026-10-11T15:43:20.993420+00:00",
+    }]
+    frame = _grpc_frame(_config_message(_product_field(4)), wrap=True)
+    merged = collect.limits_with_credits(limits, frame)
+    chat = [entry for entry in merged if entry["label"] == "Grok Chat"]
+
+    self.assertEqual(len(chat), 1)
+    self.assertEqual(chat[0]["percent"], 0.42)
+
+  def test_rest_chat_row_without_percent_is_zero_when_grpc_fails(self) -> None:
+    limits = collect.limits_with_credits(
+      CLI_LIMITS,
+      rest_products=[
+        {"product": "GrokBuild", "usagePercent": 17},
+        {"product": "GrokChat"},
+      ],
+      fetch=lambda: (_ for _ in ()).throw(OSError("down")),
+    )
+
+    self.assertEqual(
+      [entry["label"] for entry in limits],
+      ["Weekly", "Grok Build", "Grok Chat"],
+    )
+    self.assertEqual(limits[2]["percent"], 0.0)
+    self.assertEqual(limits[2]["resetsAt"], CLI_LIMITS[0]["resetsAt"])
+
+  def test_imagine_api_and_other_need_an_explicit_percent(self) -> None:
+    omitted = collect.limits_with_credits(
+      CLI_LIMITS,
+      _grpc_frame(_config_message(_product_field(1), _product_field(3), _product_field(5))),
+    )
+    present = collect.limits_with_credits(
+      CLI_LIMITS,
+      _grpc_frame(_config_message(_product_field(5, 3.0))),
+    )
+
+    self.assertNotIn("API", [entry["label"] for entry in omitted])
+    self.assertNotIn("Other", [entry["label"] for entry in omitted])
+    self.assertNotIn("Imagine", [entry["label"] for entry in omitted])
+    imagine = next(entry for entry in present if entry["label"] == "Imagine")
+    self.assertAlmostEqual(imagine["percent"], 0.03)
+
+  def test_chat_and_voice_are_inserted_ahead_of_grok_bot(self) -> None:
+    limits = CLI_LIMITS + [{
+      "label": "Grok Bot",
+      "title": "Grok Bot",
+      "percent": 0.044,
+      "resetsAt": "2026-10-10T08:09:00+00:00",
+    }]
+    frame = _grpc_frame(_config_message(_product_field(4), _product_field(6, 8.0)), wrap=True)
+    merged = collect.limits_with_credits(limits, frame)
+
+    self.assertEqual(
+      [entry["label"] for entry in merged],
+      ["Weekly", "Grok Build", "Grok Chat", "Grok Voice", "Grok Bot"],
+    )
+    self.assertEqual(merged[2]["percent"], 0.0)
+    self.assertAlmostEqual(merged[3]["percent"], 0.08)
+    self.assertEqual(merged[4]["percent"], 0.044)
 
 
 if __name__ == "__main__":
