@@ -5,9 +5,9 @@ Omarchy's stock updater only ships Claude, Codex, and Fireworks collectors.
 This writes the same record contract for Grok from:
 
 - ~/.grok/sessions/**/updates.jsonl  (per-turn token usage)
-- https://cli-chat-proxy.grok.com/v1/billing?format=credits  (weekly pool and Grok Build)
-- https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig  (Grok Chat and Grok Voice)
-- Grok Bot's Cursor sand session (weekly Grok Bot allowance)
+- https://cli-chat-proxy.grok.com/v1/billing?format=credits  (one combined weekly pool, or the older per-product pools)
+- https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig  (Grok Chat and Grok Voice on a split plan)
+- Grok Bot's Cursor sand session (its own meter, only on a split plan)
 
 The agents panel discovers ~/.local/state/omarchy/agents/usage/*.json only
 when its own updater exits. A grok.json that appears after that scan stays
@@ -157,6 +157,7 @@ def empty_stats() -> dict[str, Any]:
     "totalSessions": 0,
     "activeDays": 0,
     "activeDates": [],
+    "lifetimeTotalTokens": 0,
   }
 
 
@@ -302,6 +303,7 @@ def scan_sessions(sessions_dir: Path) -> dict[str, Any]:
   prompts = 0
   today_prompt_count = 0
   today_token_total = 0
+  lifetime_total = 0
 
   files = sessions_dir.glob("*/*/updates.jsonl") if sessions_dir.is_dir() else []
   for path in files:
@@ -341,10 +343,7 @@ def scan_sessions(sessions_dir: Path) -> dict[str, Any]:
             continue
           seen.add(key)
 
-          input_tokens = number(usage.get("inputTokens"))
-          output_tokens = number(usage.get("outputTokens"))
-          cache_read = number(usage.get("cachedReadTokens") or usage.get("cacheReadInputTokens"))
-          cache_write = number(usage.get("cacheCreationTokens") or usage.get("cachedWriteTokens"))
+          input_tokens, output_tokens, cache_read, cache_write = accounted_tokens(usage)
           total = input_tokens + output_tokens + cache_read + cache_write
           if total <= 0:
             continue
@@ -358,6 +357,7 @@ def scan_sessions(sessions_dir: Path) -> dict[str, Any]:
           sessions.add(sid)
           active_days.add(day)
           prompts += 1
+          lifetime_total += total
           bucket = usage_by_model.setdefault(model, empty_bucket())
           bucket["inputTokens"] += input_tokens
           bucket["outputTokens"] += output_tokens
@@ -392,6 +392,7 @@ def scan_sessions(sessions_dir: Path) -> dict[str, Any]:
     "totalSessions": len(sessions),
     "activeDays": len(active_days),
     "activeDates": sorted(active_days),
+    "lifetimeTotalTokens": lifetime_total,
   }
 
 
@@ -453,6 +454,151 @@ def token_expired(expires_at: str) -> bool:
   if parsed.tzinfo is None:
     parsed = parsed.replace(tzinfo=dt.timezone.utc)
   return parsed <= dt.datetime.now(dt.timezone.utc)
+
+
+def accounted_tokens(usage: dict[str, Any]) -> tuple[int, int, int, int]:
+  """Uncached input, output, cache read, cache write.
+
+  Grok's inputTokens already includes cached reads: totalTokens is input plus
+  output. Counting the cache again doubles the day and week totals the panel
+  shows. A total that already adds the cache on top is left as reported.
+  """
+  raw_input = number(usage.get("inputTokens"))
+  output = number(usage.get("outputTokens"))
+  cached = number(usage.get("cachedReadTokens") or usage.get("cacheReadInputTokens"))
+  created = number(usage.get("cacheCreationTokens") or usage.get("cachedWriteTokens"))
+  reported = number(usage.get("totalTokens")) if usage.get("totalTokens") is not None else None
+  if reported is not None and reported == raw_input + output + cached + created:
+    return raw_input, output, cached, created
+  if cached > 0 and raw_input >= cached:
+    return raw_input - cached, output, cached, created
+  return raw_input, output, cached, created
+
+
+_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def percent_text(fraction: float) -> str:
+  """The whole-number percent the panel otherwise hides until hover."""
+  points = fraction * 100
+  whole = round(points)
+  if whole == 0 and points > 0:
+    return f"{points:.1f}%"
+  return f"{int(whole)}%"
+
+
+def with_visible_percent(entry: dict[str, Any]) -> dict[str, Any]:
+  copied = dict(entry)
+  base = str(copied.get("label") or "Weekly").strip()
+  if base.endswith("%"):
+    base = base.rsplit(" ", 1)[0].strip() or "Weekly"
+  try:
+    fraction = float(copied.get("percent"))
+  except (TypeError, ValueError):
+    return copied
+  copied["label"] = base
+  copied["title"] = f"{base} {percent_text(fraction)}"
+  return copied
+
+
+def weekday_name(iso_date: str) -> str:
+  try:
+    parsed = dt.date.fromisoformat(str(iso_date))
+  except ValueError:
+    return ""
+  return _WEEKDAYS[parsed.weekday()]
+
+
+def day_meters(stats: dict[str, Any]) -> list[dict[str, Any]]:
+  """One row per recent day. The weekday stays on the left; the token total is valueText.
+
+  The Agents panel draws valueText on the right of the meter. The meter stays
+  empty. A filled day bar would look like another allowance percent, and
+  anything at 90% lights the icon as if the subscription were running out.
+  """
+  days = stats.get("recentDays")
+  if not isinstance(days, list):
+    return []
+  rows: list[dict[str, Any]] = []
+  for day in days:
+    if not isinstance(day, dict):
+      continue
+    name = weekday_name(str(day.get("date") or ""))
+    if not name:
+      continue
+    total = compact_count(number(day.get("messageCount")))
+    rows.append({
+      "label": name,
+      "title": name,
+      "valueText": total,
+      "percent": 0,
+      "resetsAt": "",
+    })
+  return rows
+
+
+def compact_count(value: int) -> str:
+  n = max(0, int(value))
+  if n >= 1_000_000_000:
+    return f"{n / 1_000_000_000:.1f}B"
+  if n >= 1_000_000:
+    return f"{n / 1_000_000:.1f}M"
+  if n >= 1_000:
+    return f"{n / 1_000:.1f}K"
+  return str(n)
+
+
+def lifetime_tokens(stats: dict[str, Any]) -> int:
+  """All tokens still on disk. Cached input is already split out of the buckets."""
+  if "lifetimeTotalTokens" in stats:
+    return number(stats.get("lifetimeTotalTokens"))
+  models = stats.get("modelUsage")
+  if not isinstance(models, dict):
+    return 0
+  total = 0
+  for bucket in models.values():
+    if not isinstance(bucket, dict):
+      continue
+    total += (
+      number(bucket.get("inputTokens"))
+      + number(bucket.get("outputTokens"))
+      + number(bucket.get("cacheReadInputTokens"))
+      + number(bucket.get("cacheCreationInputTokens"))
+    )
+  return total
+
+
+def usage_caption(stats: dict[str, Any]) -> str:
+  """Today, this week, and lifetime, for the line beside the Grok name."""
+  today = number(stats.get("todayTotalTokens"))
+  week = 0
+  days = stats.get("recentDays")
+  if isinstance(days, list):
+    for day in days:
+      if isinstance(day, dict):
+        week += number(day.get("messageCount"))
+  parts: list[str] = []
+  if today > 0 or week > 0:
+    parts.append(f"{compact_count(today)} today · {compact_count(week)} this week")
+  lifetime = lifetime_tokens(stats)
+  if lifetime > 0:
+    parts.append(f"{compact_count(lifetime)} lifetime")
+  return " · ".join(parts)
+
+
+def tier_from_settings(home: Path) -> str:
+  raw = read_regular_file(home / "settings_cache.json", MAX_AUTH_FILE_BYTES)
+  if raw is None:
+    return ""
+  try:
+    cached = json.loads(raw.decode("utf-8"))
+    payload = json.loads(cached.get("payload") or "{}") if isinstance(cached, dict) else {}
+  except Exception:
+    return ""
+  settings = payload.get("settings") if isinstance(payload, dict) else None
+  if not isinstance(settings, dict):
+    return ""
+  return str(settings.get("subscription_tier_display") or "").strip()
 
 
 def normalize_percent(value: Any) -> float:
@@ -562,9 +708,57 @@ def probe_limits(token: str) -> dict[str, Any]:
       "helpText": "Couldn't reach Grok billing. Retrying shortly. Local Grok stats are still shown.",
     }
 
+  parsed = limits_from_payload(payload, fetch=lambda: fetch_credits_config(safe))
+  if not parsed.get("ok"):
+    return {"ok": False, "helpText": parsed.get("helpText") or "Grok billing returned no usage. Local Grok stats are still shown."}
+  return {
+    "ok": True,
+    "limits": parsed["limits"],
+    "tierLabel": parsed.get("tierLabel") or "",
+    "unified": parsed.get("unified") is True,
+  }
+
+
+def _window_label(period: dict[str, Any]) -> str:
+  kind = str(period.get("type") or "")
+  return "Weekly" if "WEEK" in kind.upper() else "Monthly"
+
+
+def _unified_window(config: dict[str, Any]) -> dict[str, Any]:
+  """The one combined pool. Product rows are shares of it, not extra meters."""
+  period = config.get("currentPeriod") if isinstance(config.get("currentPeriod"), dict) else {}
+  label = _window_label(period)
+  resets_at = normalize_reset_at(period.get("end") or config.get("billingPeriodEnd"))
+  percent = normalize_percent(config.get("creditUsagePercent") or 0)
+  if percent < 0:
+    percent = 0.0
+  return with_visible_percent({
+    "label": label,
+    "title": label,
+    "percent": percent,
+    "resetsAt": resets_at,
+  })
+
+
+def limits_from_payload(
+  payload: Any,
+  *,
+  fetch: Callable[[], tuple[int, bytes]] | None = None,
+) -> dict[str, Any]:
+  """Limits from a billing JSON body. A combined plan is one window."""
   config = payload.get("config") if isinstance(payload, dict) else None
   if not isinstance(config, dict):
-    return {"ok": False, "helpText": "Grok billing returned no usage. Local Grok stats are still shown."}
+    return {
+      "ok": False,
+      "unified": False,
+      "limits": [],
+      "tierLabel": "",
+      "helpText": "Grok billing returned no usage. Local Grok stats are still shown.",
+    }
+
+  tier = str(config.get("subscriptionTier") or (payload.get("subscriptionTier") if isinstance(payload, dict) else "") or "").strip()
+  if config.get("isUnifiedBillingUser") is True:
+    return {"ok": True, "unified": True, "limits": [_unified_window(config)], "tierLabel": tier}
 
   period = config.get("currentPeriod") if isinstance(config.get("currentPeriod"), dict) else {}
   resets_at = normalize_reset_at(period.get("end") or config.get("billingPeriodEnd"))
@@ -591,16 +785,20 @@ def probe_limits(token: str) -> dict[str, Any]:
       limits,
       resets_at=resets_at,
       rest_products=product_rows,
-      fetch=lambda: fetch_credits_config(safe),
+      fetch=fetch,
     )
   except Exception:
     pass
 
   if not limits:
-    return {"ok": False, "helpText": "Grok billing returned no limits. Local Grok stats are still shown."}
-
-  tier = str(config.get("subscriptionTier") or payload.get("subscriptionTier") or "").strip()
-  return {"ok": True, "limits": limits, "tierLabel": tier}
+    return {
+      "ok": False,
+      "unified": False,
+      "limits": [],
+      "tierLabel": tier,
+      "helpText": "Grok billing returned no limits. Local Grok stats are still shown.",
+    }
+  return {"ok": True, "unified": False, "limits": limits, "tierLabel": tier}
 
 
 def fetch_credits_config(token: str) -> tuple[int, bytes]:
@@ -1342,22 +1540,33 @@ def collect_limits(token: str, expires_at: str, force: bool) -> dict[str, Any]:
     return result
 
   fetched_at = number(cached.get("fetchedAtMs")) / 1000
-  if fallback and not force and time.time() - fetched_at < PROBE_MIN_INTERVAL_SECONDS:
+  # Caches written before the combined-pool flag still list product rows as
+  # separate meters. Re-probe those instead of painting the old bars.
+  if fallback and "unified" in cached and not force and time.time() - fetched_at < PROBE_MIN_INTERVAL_SECONDS:
     result["limits"] = fallback
     return result
 
   probe = probe_limits(token)
   if probe["ok"]:
-    merged = limits_with_grok_bot(probe["limits"])
-    result["limits"] = merged["limits"]
+    # A combined subscription has one pool. Product rows, voice, and Grok Bot
+    # are shares of that pool, so they must not become more bars.
+    if probe.get("unified"):
+      merged_limits = probe["limits"]
+      auth_help = ""
+    else:
+      merged = limits_with_grok_bot(probe["limits"])
+      merged_limits = merged["limits"]
+      auth_help = merged["authHelpText"]
+    result["limits"] = merged_limits
     result["tierLabel"] = str(probe.get("tierLabel") or result["tierLabel"])
     write_json(probe_cache, {
       "fetchedAtMs": round(time.time() * 1000),
-      "limits": merged["limits"],
+      "limits": merged_limits,
       "tierLabel": result["tierLabel"],
+      "unified": probe.get("unified") is True,
     })
     result["usageStatusText"] = ""
-    result["authHelpText"] = merged["authHelpText"] or AUTH_HELP
+    result["authHelpText"] = auth_help or AUTH_HELP
     return result
 
   if probe.get("transport"):
@@ -1376,7 +1585,8 @@ def collect_limits(token: str, expires_at: str, force: bool) -> dict[str, Any]:
 def build_record(force: bool, limits_only: bool, cache_seconds: float) -> dict[str, Any]:
   home = grok_home()
   scan_age = 0 if force else (900 if limits_only else cache_seconds)
-  stats = cached_scan(home / "sessions", scan_age)
+  stats = dict(cached_scan(home / "sessions", scan_age))
+  stats["lifetimeTotalTokens"] = lifetime_tokens(stats)
   token, expires_at = access_token(home / "auth.json")
   limits = collect_limits(token, expires_at, force)
 
@@ -1387,10 +1597,10 @@ def build_record(force: bool, limits_only: bool, cache_seconds: float) -> dict[s
     "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
     "ready": number(stats.get("totalPrompts")) > 0 or len(limits["limits"]) > 0,
     "hasLocalStats": number(stats.get("totalPrompts")) > 0,
-    "tierLabel": limits.get("tierLabel") or "",
+    "tierLabel": usage_caption(stats) or limits.get("tierLabel") or tier_from_settings(home),
     "usageStatusText": limits["usageStatusText"],
     "authHelpText": limits["authHelpText"],
-    "limits": limits["limits"],
+    "limits": [with_visible_percent(entry) if isinstance(entry, dict) and entry.get("resetsAt") else entry for entry in limits["limits"]] + day_meters(stats),
   }
   if limits.get("retryAdvised"):
     record["retryAdvised"] = True

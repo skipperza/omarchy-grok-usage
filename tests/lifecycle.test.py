@@ -9,9 +9,11 @@ restart, leaves that scan with nothing to show, so the icon collapses.
 from __future__ import annotations
 
 import json
+import os
 import struct
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -426,6 +428,242 @@ class ChatVoiceLimits(unittest.TestCase):
     self.assertEqual(merged[2]["percent"], 0.0)
     self.assertAlmostEqual(merged[3]["percent"], 0.08)
     self.assertEqual(merged[4]["percent"], 0.044)
+
+
+class UnifiedBilling(unittest.TestCase):
+  def test_combined_pool_is_one_weekly_bar(self) -> None:
+    # Product rows are shares of one pool (10 + 1 = 11), not separate limits.
+    payload = {
+      "config": {
+        "currentPeriod": {
+          "type": "USAGE_PERIOD_TYPE_WEEKLY",
+          "end": "2026-11-01T06:38:01.689+00:00",
+        },
+        "creditUsagePercent": 11.0,
+        "productUsage": [
+          {"product": "GrokBot", "usagePercent": 10.0},
+          {"product": "Api", "usagePercent": 1.0},
+        ],
+        "isUnifiedBillingUser": True,
+      }
+    }
+    calls: list[int] = []
+
+    result = collect.limits_from_payload(payload, fetch=lambda: calls.append(1) or (200, b"unused"))
+
+    self.assertEqual(calls, [])
+    self.assertTrue(result["unified"])
+    self.assertEqual([entry["label"] for entry in result["limits"]], ["Weekly"])
+    self.assertEqual(result["limits"][0]["title"], "Weekly 11%")
+    self.assertAlmostEqual(result["limits"][0]["percent"], 0.11)
+    self.assertTrue(str(result["limits"][0]["resetsAt"]).startswith("2026-11-01T06:38:01"))
+
+  def test_unified_probe_does_not_add_grok_bot(self) -> None:
+    original_probe = collect.probe_limits
+    original_bot = collect.limits_with_grok_bot
+    called: list[str] = []
+
+    def probe(_token: str) -> dict:
+      return {
+        "ok": True,
+        "unified": True,
+        "tierLabel": "",
+        "limits": [{
+          "label": "Weekly",
+          "title": "Weekly",
+          "percent": 0.11,
+          "resetsAt": "2026-11-01T06:38:01+00:00",
+        }],
+      }
+
+    def bot(limits: list, *_args, **_kwargs) -> dict:
+      called.append("bot")
+      return {"limits": limits + [{"label": "Grok Bot", "title": "Grok Bot", "percent": 0.2, "resetsAt": ""}], "authHelpText": ""}
+
+    collect.probe_limits = probe
+    collect.limits_with_grok_bot = bot
+    try:
+      result = collect.collect_limits("token", "2099-01-01T00:00:00+00:00", True)
+    finally:
+      collect.probe_limits = original_probe
+      collect.limits_with_grok_bot = original_bot
+
+    self.assertEqual(called, [])
+    self.assertEqual([entry["label"] for entry in result["limits"]], ["Weekly"])
+
+
+class TokenStats(unittest.TestCase):
+  def test_cached_input_is_not_counted_twice(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+      session = Path(tmp) / "folder" / "session"
+      session.mkdir(parents=True)
+      usage = {
+        "inputTokens": 100,
+        "outputTokens": 10,
+        "cachedReadTokens": 80,
+        "cacheCreationTokens": 0,
+        "totalTokens": 110,
+        "modelUsage": {
+          "grok-4.7-build": {
+            "inputTokens": 100,
+            "outputTokens": 10,
+            "cachedReadTokens": 80,
+            "cacheCreationTokens": 0,
+            "totalTokens": 110,
+          }
+        },
+      }
+      line = {
+        "timestamp": time.time(),
+        "params": {
+          "sessionId": "session",
+          "update": {
+            "sessionUpdate": "turn_completed",
+            "prompt_id": "prompt-1",
+            "usage": usage,
+          },
+        },
+      }
+      (session / "updates.jsonl").write_text(json.dumps(line) + "\n", encoding="utf-8")
+
+      stats = collect.scan_sessions(Path(tmp))
+
+    self.assertEqual(stats["todayTotalTokens"], 110)
+    today = next(day for day in stats["recentDays"] if day["messageCount"] == 110)
+    self.assertEqual(today["messageCount"], 110)
+    bucket = stats["modelUsage"]["grok-4.7-build"]
+    counted = (
+      bucket["inputTokens"]
+      + bucket["outputTokens"]
+      + bucket["cacheReadInputTokens"]
+      + bucket["cacheCreationInputTokens"]
+    )
+    self.assertEqual(counted, 110)
+
+  def test_each_weekday_total_is_its_own_row(self) -> None:
+    rows = collect.day_meters({
+      "recentDays": [
+        {"date": "2026-10-20", "messageCount": 2_487_368},
+        {"date": "2026-10-21", "messageCount": 0},
+        {"date": "2026-10-26", "messageCount": 4_059_756},
+      ],
+    })
+
+    self.assertEqual([row["title"] for row in rows], ["Tue", "Wed", "Mon"])
+    self.assertEqual([row["valueText"] for row in rows], ["2.5M", "0", "4.1M"])
+    self.assertTrue(all(row["percent"] == 0 and row["resetsAt"] == "" for row in rows))
+
+  def test_caption_names_today_and_this_week(self) -> None:
+    caption = collect.usage_caption({
+      "todayTotalTokens": 7_899_756,
+      "recentDays": [
+        {"date": "2026-10-20", "messageCount": 4_800_000},
+        {"date": "2026-10-26", "messageCount": 7_899_756},
+      ],
+    })
+
+    self.assertEqual(caption, "7.9M today · 12.7M this week")
+
+  def test_caption_includes_lifetime_tokens(self) -> None:
+    caption = collect.usage_caption({
+      "todayTotalTokens": 7_899_756,
+      "recentDays": [
+        {"date": "2026-10-20", "messageCount": 4_800_000},
+        {"date": "2026-10-26", "messageCount": 7_899_756},
+      ],
+      "modelUsage": {
+        "grok-4.7-build": {
+          "inputTokens": 1_000_000_000,
+          "outputTokens": 200_000_000,
+          "cacheReadInputTokens": 36_000_000,
+          "cacheCreationInputTokens": 0,
+        },
+      },
+    })
+
+    self.assertEqual(caption, "7.9M today · 12.7M this week · 1.2B lifetime")
+
+  def test_caption_names_lifetime_when_this_week_is_empty(self) -> None:
+    caption = collect.usage_caption({
+      "todayTotalTokens": 0,
+      "recentDays": [],
+      "lifetimeTotalTokens": 1_500,
+    })
+
+    self.assertEqual(caption, "1.5K lifetime")
+
+  def test_scan_records_lifetime_token_total(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+      session = Path(tmp) / "folder" / "session"
+      session.mkdir(parents=True)
+      usage = {
+        "inputTokens": 100,
+        "outputTokens": 10,
+        "cachedReadTokens": 80,
+        "cacheCreationTokens": 0,
+        "totalTokens": 110,
+      }
+      line = {
+        "timestamp": time.time(),
+        "params": {
+          "sessionId": "session",
+          "update": {
+            "sessionUpdate": "turn_completed",
+            "prompt_id": "prompt-1",
+            "usage": usage,
+          },
+        },
+      }
+      (session / "updates.jsonl").write_text(json.dumps(line) + "\n", encoding="utf-8")
+
+      stats = collect.scan_sessions(Path(tmp))
+
+    self.assertEqual(stats["lifetimeTotalTokens"], 110)
+
+  def test_record_publishes_lifetime_when_the_scan_cache_omits_it(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+      root = Path(tmp)
+      home = root / "grok"
+      (home / "sessions").mkdir(parents=True)
+      cache = root / "cache" / "omarchy" / "agent-usage"
+      cache.mkdir(parents=True)
+      (cache / "grok-sessions.json").write_text(json.dumps({
+        "todayPrompts": 1,
+        "todaySessions": 1,
+        "todayTotalTokens": 110,
+        "todayTokensByModel": {},
+        "recentDays": [{"date": "2026-10-31", "messageCount": 110}],
+        "modelUsage": {
+          "grok-4.7-build": {
+            "inputTokens": 20,
+            "outputTokens": 10,
+            "cacheReadInputTokens": 80,
+            "cacheCreationInputTokens": 0,
+          },
+        },
+        "totalPrompts": 1,
+        "totalSessions": 1,
+        "activeDays": 1,
+        "activeDates": ["2026-10-31"],
+      }), encoding="utf-8")
+      old_home = os.environ.get("GROK_HOME")
+      old_cache = os.environ.get("XDG_CACHE_HOME")
+      os.environ["GROK_HOME"] = str(home)
+      os.environ["XDG_CACHE_HOME"] = str(root / "cache")
+      try:
+        record = collect.build_record(False, False, 900)
+      finally:
+        if old_home is None:
+          os.environ.pop("GROK_HOME", None)
+        else:
+          os.environ["GROK_HOME"] = old_home
+        if old_cache is None:
+          os.environ.pop("XDG_CACHE_HOME", None)
+        else:
+          os.environ["XDG_CACHE_HOME"] = old_cache
+
+    self.assertEqual(record["lifetimeTotalTokens"], 110)
+    self.assertEqual(record["tierLabel"], "110 today · 110 this week · 110 lifetime")
 
 
 if __name__ == "__main__":

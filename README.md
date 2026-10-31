@@ -2,7 +2,7 @@
 
 Adds **Grok** to Omarchy's **existing AI toolbar widget** — the AI icon already on the top bar. It does not add a second icon.
 
-After install, click that same AI button. You get a **Grok** chip next to **Claude Code** (and Codex / Fireworks if you use them): the weekly SuperGrok pool, Grok Build, Grok Chat, Grok Voice, Grok Bot, and local token stats from `~/.grok/sessions`.
+After install, click that same AI button. You get a **Grok** section next to any other agent you use. A combined X subscription shows one weekly bar, with the used percent in the label. Under it, each of the last seven days names the weekday on the left of the bar and that day's token total on the right. The line beside Grok names today, this week, and lifetime tokens from sessions still on disk. Older split plans still list each product meter.
 
 ![Grok inside Omarchy's existing AI toolbar widget](preview.png)
 
@@ -30,7 +30,7 @@ Leave the built-in AI icon where it is. After the first scan, click it and switc
 
 This plugin is a headless service. It only writes a Grok usage record for the stock panel to display.
 
-Weekly and Grok Build percents come from `https://cli-chat-proxy.grok.com/v1/billing?format=credits` using the token in `~/.grok/auth.json`. Grok Chat and Grok Voice use that same sign-in against `GetGrokCreditsConfig` when the billing list omits a percent. The Grok Bot meter comes from that app's Cursor sand session. Token charts come from `~/.grok/sessions/**/updates.jsonl`.
+The weekly percent comes from `https://cli-chat-proxy.grok.com/v1/billing?format=credits` using the token in `~/.grok/auth.json`. On a combined plan (`isUnifiedBillingUser`) that percent is the only meter: Grok, Grok Bot, voice, and the API are shares of the same pool. A split plan still adds Grok Build, Grok Chat, and Grok Voice from `GetGrokCreditsConfig`, plus Grok Bot from that app's Cursor sand session. Token totals come from `~/.grok/sessions/**/updates.jsonl`. Cached input is counted once.
 
 ## Remove
 
