@@ -56,7 +56,11 @@ SAND_USAGE_RPC = CURSOR_BACKEND + "/aiserver.v1.DashboardService/GetSandUsageSta
 CURSOR_TOKEN_URL = CURSOR_BACKEND + "/oauth/token"
 # Public Cursor installed-app OAuth client id, not a user secret.
 CURSOR_CLIENT_ID = "KbZUR41cY7W6zRSdpSUJ7I7mLYBKOCmB"
-USAGE_HOSTS = frozenset({"cli-chat-proxy.grok.com", "api2.cursor.sh", "grok.com"})
+# Public xAI CLI OAuth token endpoint. The client id lives in auth.json.
+XAI_TOKEN_URL = "https://auth.x.ai/oauth2/token"
+# Renew before the 5-minute poll can paint "Sign-in expired".
+REFRESH_SKEW_SECONDS = 600
+USAGE_HOSTS = frozenset({"cli-chat-proxy.grok.com", "api2.cursor.sh", "grok.com", "auth.x.ai"})
 CHAT_LABEL = "Grok Chat"
 VOICE_LABEL = "Grok Voice"
 # GetGrokCreditsConfig product enum. Do not remap.
@@ -423,25 +427,155 @@ def cached_scan(sessions_dir: Path, max_age_seconds: float) -> dict[str, Any]:
 # ------------------------------------------------------------------- limits
 
 
-def access_token(auth_path: Path) -> tuple[str, str]:
+def load_auth(auth_path: Path) -> tuple[dict[str, Any], str, dict[str, Any]] | None:
   raw = read_regular_file(auth_path, MAX_AUTH_FILE_BYTES)
   if raw is None:
-    return "", ""
+    return None
   try:
     data = json.loads(raw.decode("utf-8"))
   except Exception:
-    return "", ""
+    return None
   if not isinstance(data, dict):
-    return "", ""
-  for entry in data.values():
+    return None
+  for key, entry in data.items():
     if not isinstance(entry, dict):
       continue
     token = str(entry.get("key") or "").strip()
-    if not token:
-      continue
-    expires = str(entry.get("expires_at") or "")
+    if token:
+      return data, str(key), entry
+  return None
+
+
+def access_token(auth_path: Path) -> tuple[str, str]:
+  loaded = load_auth(auth_path)
+  if loaded is None:
+    return "", ""
+  _data, _key, entry = loaded
+  return str(entry.get("key") or "").strip(), str(entry.get("expires_at") or "")
+
+
+def token_due(expires_at: str, skew_seconds: int = REFRESH_SKEW_SECONDS) -> bool:
+  """True when the access token is missing an expiry, expired, or inside the skew."""
+  if not expires_at:
+    return True
+  try:
+    parsed = dt.datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+  except Exception:
+    return True
+  if parsed.tzinfo is None:
+    parsed = parsed.replace(tzinfo=dt.timezone.utc)
+  return parsed <= dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=skew_seconds)
+
+
+def refresh_access(client_id: str, refresh_token: str) -> dict[str, Any] | None:
+  """Exchange a saved refresh token. Returns new fields, never logs them."""
+  client = _header_safe(client_id)
+  refresh = _header_safe(refresh_token)
+  if client is None or refresh is None:
+    return None
+  body = urllib.parse.urlencode({
+    "grant_type": "refresh_token",
+    "refresh_token": refresh,
+    "client_id": client,
+  }).encode("utf-8")
+  try:
+    status, payload = usage_request(
+      XAI_TOKEN_URL,
+      method="POST",
+      headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+      data=body,
+    )
+  except Exception:
+    return None
+  if status != 200:
+    return None
+  try:
+    parsed = json.loads(payload.decode("utf-8"))
+  except Exception:
+    return None
+  if not isinstance(parsed, dict):
+    return None
+  access = _header_safe(parsed.get("access_token"))
+  if access is None:
+    return None
+  try:
+    expires_in = int(parsed.get("expires_in") or 0)
+  except (TypeError, ValueError):
+    expires_in = 0
+  if expires_in <= 0:
+    return None
+  rotated = parsed.get("refresh_token")
+  return {
+    "key": access,
+    "expires_in": expires_in,
+    "refresh_token": rotated if isinstance(rotated, str) and _header_safe(rotated) else None,
+  }
+
+
+def write_auth(auth_path: Path, data: dict[str, Any]) -> None:
+  auth_path.parent.mkdir(parents=True, exist_ok=True)
+  handle_fd, tmp_name = tempfile.mkstemp(dir=auth_path.parent, prefix=auth_path.name + ".", suffix=".tmp")
+  tmp = Path(tmp_name)
+  try:
+    with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+      json.dump(data, handle, indent=2)
+      handle.write("\n")
+    tmp.chmod(0o600)
+    tmp.replace(auth_path)
+  except BaseException:
+    tmp.unlink(missing_ok=True)
+    raise
+
+
+def ensure_fresh_auth(auth_path: Path) -> tuple[str, str]:
+  """Renew an expired Grok CLI login from its saved refresh token.
+
+  A failed refresh leaves the file alone so the panel can still say sign-in
+  expired instead of pretending a dead token works.
+  """
+  loaded = load_auth(auth_path)
+  if loaded is None:
+    return "", ""
+  _data, _key, entry = loaded
+  token = str(entry.get("key") or "").strip()
+  expires = str(entry.get("expires_at") or "")
+  if token and not token_due(expires):
     return token, expires
-  return "", ""
+
+  lock_fd = lock_regular_file(auth_path.parent / "auth.lock")
+  if lock_fd is None:
+    return token, expires
+  try:
+    loaded = load_auth(auth_path)
+    if loaded is None:
+      return "", ""
+    data, key, entry = loaded
+    token = str(entry.get("key") or "").strip()
+    expires = str(entry.get("expires_at") or "")
+    if token and not token_due(expires):
+      return token, expires
+    client_id = str(entry.get("oidc_client_id") or "")
+    refresh = str(entry.get("refresh_token") or "")
+    renewed = refresh_access(client_id, refresh)
+    if renewed is None:
+      return token, expires
+    expires_at = (
+      dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=renewed["expires_in"])
+    ).isoformat().replace("+00:00", "Z")
+    updated = dict(entry)
+    updated["key"] = renewed["key"]
+    updated["expires_at"] = expires_at
+    if renewed["refresh_token"]:
+      updated["refresh_token"] = renewed["refresh_token"]
+    data[key] = updated
+    write_auth(auth_path, data)
+    return renewed["key"], expires_at
+  finally:
+    try:
+      fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    except OSError:
+      pass
+    os.close(lock_fd)
 
 
 def token_expired(expires_at: str) -> bool:
@@ -1544,6 +1678,8 @@ def collect_limits(token: str, expires_at: str, force: bool) -> dict[str, Any]:
   # separate meters. Re-probe those instead of painting the old bars.
   if fallback and "unified" in cached and not force and time.time() - fetched_at < PROBE_MIN_INTERVAL_SECONDS:
     result["limits"] = fallback
+    result["usageStatusText"] = ""
+    result["authHelpText"] = ""
     return result
 
   probe = probe_limits(token)
@@ -1566,13 +1702,15 @@ def collect_limits(token: str, expires_at: str, force: bool) -> dict[str, Any]:
       "unified": probe.get("unified") is True,
     })
     result["usageStatusText"] = ""
-    result["authHelpText"] = auth_help or AUTH_HELP
+    result["authHelpText"] = auth_help
     return result
 
   if probe.get("transport"):
     result["retryAdvised"] = True
   if fallback:
     result["limits"] = fallback
+    result["usageStatusText"] = ""
+    result["authHelpText"] = "" if probe.get("transport") else str(probe.get("helpText") or "")
   else:
     result["usageStatusText"] = "Grok limits unavailable"
     result["authHelpText"] = probe["helpText"]
@@ -1587,7 +1725,7 @@ def build_record(force: bool, limits_only: bool, cache_seconds: float) -> dict[s
   scan_age = 0 if force else (900 if limits_only else cache_seconds)
   stats = dict(cached_scan(home / "sessions", scan_age))
   stats["lifetimeTotalTokens"] = lifetime_tokens(stats)
-  token, expires_at = access_token(home / "auth.json")
+  token, expires_at = ensure_fresh_auth(home / "auth.json")
   limits = collect_limits(token, expires_at, force)
 
   record = {

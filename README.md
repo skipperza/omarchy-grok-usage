@@ -42,7 +42,7 @@ Removal deletes the plugin checkout and drops `~/.local/state/omarchy/agents/usa
 
 ## Privacy
 
-The collector reads local Grok session files and the saved Grok login, then calls xAI's billing endpoint and the Grok credits-config endpoint. The Grok Bot meter reads `~/.config/Grok Bot/sand-secrets.json`, decrypts that app's Cursor session with the "Grok Bot" keyring item, and calls Cursor's sand usage RPC. It never logs tokens. Expired Grok CLI tokens are not refreshed; run `grok login` (or start Grok) to renew them. A refreshed Grok Bot access token stays in memory and is not written back to the Grok Bot config.
+The collector reads local Grok session files and the saved Grok login, then calls xAI's billing endpoint and the Grok credits-config endpoint. The Grok Bot meter reads `~/.config/Grok Bot/sand-secrets.json`, decrypts that app's Cursor session with the "Grok Bot" keyring item, and calls Cursor's sand usage RPC. It never logs tokens. An expired Grok CLI access token is renewed from the refresh token already in `~/.grok/auth.json` and written back there. If that refresh fails, run `grok login`. A refreshed Grok Bot access token stays in memory and is not written back to the Grok Bot config.
 
 ## License
 
