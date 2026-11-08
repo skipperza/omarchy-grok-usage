@@ -30,7 +30,7 @@ Leave the built-in AI icon where it is. After the first scan, click it and switc
 
 This plugin is a headless service. It only writes a Grok usage record for the stock panel to display.
 
-The weekly percent comes from `https://cli-chat-proxy.grok.com/v1/billing?format=credits` using the token in `~/.grok/auth.json`. On a combined plan (`isUnifiedBillingUser`) that percent is the only meter: Grok, Grok Bot, voice, and the API are shares of the same pool. A split plan still adds Grok Build, Grok Chat, and Grok Voice from `GetGrokCreditsConfig`, plus Grok Bot from that app's Cursor sand session. Token totals come from `~/.grok/sessions/**/updates.jsonl`. Cached input is counted once.
+The weekly percent comes from `https://cli-chat-proxy.grok.com/v1/billing?format=credits` using the token in `~/.grok/auth.json`. On a combined plan (`isUnifiedBillingUser`) that percent is the only meter: Grok, Grok Bot, voice, and the API are shares of the same pool. A split plan still adds Grok Build, Grok Chat, and Grok Voice from `GetGrokCreditsConfig`, plus Grok Bot from that app's Cursor sand session. Finished turns come from `~/.grok/sessions/**/updates.jsonl`. A turn that is still open is added from `~/.grok/logs/unified.jsonl` until that turn completes, so the current day is not stuck at zero. Cached input is counted once.
 
 ## Remove
 
@@ -42,7 +42,7 @@ Removal deletes the plugin checkout and drops `~/.local/state/omarchy/agents/usa
 
 ## Privacy
 
-The collector reads local Grok session files and the saved Grok login, then calls xAI's billing endpoint and the Grok credits-config endpoint. The Grok Bot meter reads `~/.config/Grok Bot/sand-secrets.json`, decrypts that app's Cursor session with the "Grok Bot" keyring item, and calls Cursor's sand usage RPC. It never logs tokens. An expired Grok CLI access token is renewed from the refresh token already in `~/.grok/auth.json` and written back there. If that refresh fails, run `grok login`. A refreshed Grok Bot access token stays in memory and is not written back to the Grok Bot config.
+The collector reads local Grok session files, the local Grok log for turns still in progress, and the saved Grok login, then calls xAI's billing endpoint and the Grok credits-config endpoint. The Grok Bot meter reads `~/.config/Grok Bot/sand-secrets.json`, decrypts that app's Cursor session with the "Grok Bot" keyring item, and calls Cursor's sand usage RPC. It never logs tokens. An expired Grok CLI access token is renewed from the refresh token already in `~/.grok/auth.json` and written back there. If that refresh fails, run `grok login`. A refreshed Grok Bot access token stays in memory and is not written back to the Grok Bot config.
 
 ## License
 

@@ -4,7 +4,8 @@
 Omarchy's stock updater only ships Claude, Codex, and Fireworks collectors.
 This writes the same record contract for Grok from:
 
-- ~/.grok/sessions/**/updates.jsonl  (per-turn token usage)
+- ~/.grok/sessions/**/updates.jsonl  (per-turn token usage, once a turn finishes)
+- ~/.grok/logs/unified.jsonl  (tokens already spent on a turn that is still open)
 - https://cli-chat-proxy.grok.com/v1/billing?format=credits  (one combined weekly pool, or the older per-product pools)
 - https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig  (Grok Chat and Grok Voice on a split plan)
 - Grok Bot's Cursor sand session (its own meter, only on a split plan)
@@ -79,6 +80,10 @@ MAX_SESSION_FILE_BYTES = 32 * 1024 * 1024
 MAX_HTTP_BODY_BYTES = 256 * 1024
 MAX_JSONL_LINE_BYTES = 1024 * 1024
 MAX_TOKEN_CHARS = 16 * 1024
+# The last inference_done of a finished turn is logged just after that turn's
+# timestamp. Keep this window or the same tokens are counted twice.
+OPEN_TURN_SKEW_SECONDS = 2
+INFERENCE_DONE_MSG = "shell.turn.inference_done"
 JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
 
 
@@ -116,19 +121,76 @@ def local_date_string() -> str:
   return date_string(dt.datetime.now().date())
 
 
-def local_date_from_timestamp(value: Any) -> str:
+def unix_timestamp(value: Any) -> float | None:
+  """Unix seconds from an epoch number, millisecond epoch, or ISO-8601 string."""
   if value is None:
-    return local_date_string()
+    return None
+  if isinstance(value, str):
+    text = value.strip()
+    if not text:
+      return None
+    if text.endswith("Z"):
+      text = text[:-1] + "+00:00"
+    try:
+      parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+      return None
+    if parsed.tzinfo is None:
+      parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.timestamp()
   try:
     seconds = float(value)
   except (TypeError, ValueError):
-    return local_date_string()
+    return None
+  if seconds != seconds:
+    return None
   if seconds > 10_000_000_000:
     seconds /= 1000.0
+  return seconds
+
+
+def local_date_from_timestamp(value: Any) -> str:
+  seconds = unix_timestamp(value)
+  if seconds is None:
+    return local_date_string()
   try:
     return date_string(dt.datetime.fromtimestamp(seconds).date())
   except Exception:
     return local_date_string()
+
+
+def read_text_bounded(path: Path, max_bytes: int) -> str | None:
+  """Read a regular file, keeping the tail when it is larger than max_bytes.
+
+  Open turns are at the end of the log. A cap that kept only the start would
+  drop the tokens the panel is missing.
+  """
+  flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+  try:
+    fd = os.open(path, flags)
+  except OSError:
+    return None
+  skipped_prefix = False
+  try:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_size < 0:
+      return None
+    skipped_prefix = info.st_size > max_bytes
+    if skipped_prefix:
+      os.lseek(fd, info.st_size - max_bytes, os.SEEK_SET)
+    data = os.read(fd, max_bytes)
+  except OSError:
+    return None
+  finally:
+    try:
+      os.close(fd)
+    except OSError:
+      pass
+  text = data.decode("utf-8", errors="replace")
+  if skipped_prefix:
+    newline = text.find("\n")
+    text = "" if newline < 0 else text[newline + 1 :]
+  return text
 
 
 def number(value: Any) -> int:
@@ -300,6 +362,8 @@ def scan_sessions(sessions_dir: Path) -> dict[str, Any]:
 
   seen: set[str] = set()
   sessions: set[str] = set()
+  known_sessions: set[str] = set()
+  last_completed: dict[str, float] = {}
   active_days: set[str] = set()
   today_sessions: set[str] = set()
   today_tokens: dict[str, int] = {}
@@ -315,6 +379,7 @@ def scan_sessions(sessions_dir: Path) -> dict[str, Any]:
     fd = open_regular_file(path, MAX_SESSION_FILE_BYTES)
     if fd is None:
       continue
+    known_sessions.add(session_id)
     try:
       with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as handle:
         fd = -1
@@ -342,6 +407,13 @@ def scan_sessions(sessions_dir: Path) -> dict[str, Any]:
 
           prompt_id = str(update.get("prompt_id") or "")
           sid = str(params.get("sessionId") or session_id)
+          known_sessions.add(sid)
+          completed_at = unix_timestamp(entry.get("timestamp"))
+          if completed_at is not None:
+            for completed_id in (sid, session_id):
+              previous = last_completed.get(completed_id)
+              if previous is None or completed_at > previous:
+                last_completed[completed_id] = completed_at
           key = sid + ":" + (prompt_id or str(entry.get("timestamp") or ""))
           if key in seen:
             continue
@@ -383,7 +455,61 @@ def scan_sessions(sessions_dir: Path) -> dict[str, Any]:
         except OSError:
           pass
 
-  if prompts <= 0:
+  if sessions_dir.name == "sessions":
+    log_text = read_text_bounded(sessions_dir.parent / "logs" / "unified.jsonl", MAX_SESSION_FILE_BYTES)
+  else:
+    log_text = None
+  if log_text:
+    seen_inference: set[tuple[Any, ...]] = set()
+    for line in log_text.splitlines():
+      if INFERENCE_DONE_MSG not in line or len(line) > MAX_JSONL_LINE_BYTES:
+        continue
+      try:
+        entry = json.loads(line)
+      except Exception:
+        continue
+      if not isinstance(entry, dict) or entry.get("msg") != INFERENCE_DONE_MSG:
+        continue
+      sid = str(entry.get("sid") or "")
+      if sid not in known_sessions:
+        continue
+      when = unix_timestamp(entry.get("ts"))
+      if when is None:
+        continue
+      cutoff = last_completed.get(sid)
+      if cutoff is not None and when <= cutoff + OPEN_TURN_SKEW_SECONDS:
+        continue
+      ctx = entry.get("ctx") if isinstance(entry.get("ctx"), dict) else {}
+      prompt = number(ctx.get("prompt_tokens"))
+      completion = number(ctx.get("completion_tokens"))
+      cached = number(ctx.get("cached_prompt_tokens"))
+      if cached > prompt:
+        cached = prompt
+      total = prompt + completion
+      if total <= 0:
+        continue
+      key = (sid, when, ctx.get("loop_index"), prompt, completion)
+      if key in seen_inference:
+        continue
+      seen_inference.add(key)
+
+      day = local_date_from_timestamp(when)
+      model = "grok"
+      sessions.add(sid)
+      active_days.add(day)
+      lifetime_total += total
+      bucket = usage_by_model.setdefault(model, empty_bucket())
+      bucket["inputTokens"] += prompt - cached
+      bucket["outputTokens"] += completion
+      bucket["cacheReadInputTokens"] += cached
+      if day in recent:
+        recent[day]["messageCount"] += total
+      if day == today:
+        today_sessions.add(sid)
+        today_token_total += total
+        today_tokens[model] = today_tokens.get(model, 0) + total
+
+  if lifetime_total <= 0:
     return empty_stats()
   return {
     "todayPrompts": today_prompt_count,

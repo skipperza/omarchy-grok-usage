@@ -8,6 +8,7 @@ restart, leaves that scan with nothing to show, so the icon collapses.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import struct
@@ -664,6 +665,146 @@ class TokenStats(unittest.TestCase):
 
     self.assertEqual(record["lifetimeTotalTokens"], 110)
     self.assertEqual(record["tierLabel"], "110 today · 110 this week · 110 lifetime")
+
+  def test_open_turn_tokens_count_before_turn_completed(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp) / "grok"
+      session = home / "sessions" / "folder" / "open-session"
+      session.mkdir(parents=True)
+      (session / "updates.jsonl").write_text("", encoding="utf-8")
+      now = time.time()
+      event = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+        "msg": "shell.turn.inference_done",
+        "sid": "open-session",
+        "ctx": {
+          "loop_index": 1,
+          "prompt_tokens": 1000,
+          "cached_prompt_tokens": 800,
+          "completion_tokens": 50,
+        },
+      }
+      log_dir = home / "logs"
+      log_dir.mkdir()
+      (log_dir / "unified.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
+
+      stats = collect.scan_sessions(home / "sessions")
+
+    self.assertEqual(stats["todayTotalTokens"], 1050)
+    today = next(day for day in stats["recentDays"] if day["date"] == time.strftime("%Y-%m-%d"))
+    self.assertEqual(today["messageCount"], 1050)
+    self.assertEqual(stats["lifetimeTotalTokens"], 1050)
+
+  def test_finished_turn_inference_is_not_counted_twice(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp) / "grok"
+      session = home / "sessions" / "folder" / "done-session"
+      session.mkdir(parents=True)
+      completed = time.time() - 30
+      line = {
+        "timestamp": completed,
+        "params": {
+          "sessionId": "done-session",
+          "update": {
+            "sessionUpdate": "turn_completed",
+            "prompt_id": "prompt-1",
+            "usage": {
+              "inputTokens": 100,
+              "outputTokens": 10,
+              "cachedReadTokens": 80,
+              "cacheCreationTokens": 0,
+              "totalTokens": 110,
+            },
+          },
+        },
+      }
+      (session / "updates.jsonl").write_text(json.dumps(line) + "\n", encoding="utf-8")
+      event = {
+        "ts": dt.datetime.fromtimestamp(completed + 0.4, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "msg": "shell.turn.inference_done",
+        "sid": "done-session",
+        "ctx": {
+          "loop_index": 3,
+          "prompt_tokens": 1000,
+          "cached_prompt_tokens": 800,
+          "completion_tokens": 50,
+        },
+      }
+      log_dir = home / "logs"
+      log_dir.mkdir()
+      (log_dir / "unified.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
+
+      stats = collect.scan_sessions(home / "sessions")
+
+    self.assertEqual(stats["todayTotalTokens"], 110)
+    self.assertEqual(stats["lifetimeTotalTokens"], 110)
+
+  def test_inference_after_the_skew_window_counts_as_the_next_turn(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp) / "grok"
+      session = home / "sessions" / "folder" / "done-session"
+      session.mkdir(parents=True)
+      completed = time.time() - 30
+      line = {
+        "timestamp": completed,
+        "params": {
+          "sessionId": "done-session",
+          "update": {
+            "sessionUpdate": "turn_completed",
+            "prompt_id": "prompt-1",
+            "usage": {
+              "inputTokens": 100,
+              "outputTokens": 10,
+              "cachedReadTokens": 80,
+              "totalTokens": 110,
+            },
+          },
+        },
+      }
+      (session / "updates.jsonl").write_text(json.dumps(line) + "\n", encoding="utf-8")
+      event = {
+        "ts": dt.datetime.fromtimestamp(completed + 5, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "msg": "shell.turn.inference_done",
+        "sid": "done-session",
+        "ctx": {
+          "loop_index": 1,
+          "prompt_tokens": 1000,
+          "cached_prompt_tokens": 800,
+          "completion_tokens": 50,
+        },
+      }
+      log_dir = home / "logs"
+      log_dir.mkdir()
+      (log_dir / "unified.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
+
+      stats = collect.scan_sessions(home / "sessions")
+
+    self.assertEqual(stats["todayTotalTokens"], 1160)
+
+  def test_open_turn_is_read_from_the_end_of_a_long_log(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp) / "grok"
+      session = home / "sessions" / "folder" / "open-session"
+      session.mkdir(parents=True)
+      (session / "updates.jsonl").write_text("", encoding="utf-8")
+      event = json.dumps({
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "msg": "shell.turn.inference_done",
+        "sid": "open-session",
+        "ctx": {"loop_index": 1, "prompt_tokens": 1000, "cached_prompt_tokens": 0, "completion_tokens": 50},
+      })
+      log_dir = home / "logs"
+      log_dir.mkdir()
+      (log_dir / "unified.jsonl").write_text(("pad\n" * 40) + event + "\n", encoding="utf-8")
+      old_limit = collect.MAX_SESSION_FILE_BYTES
+      # The cap starts inside the padding, so only a tail read still sees the event.
+      collect.MAX_SESSION_FILE_BYTES = len(event) + 8
+      try:
+        stats = collect.scan_sessions(home / "sessions")
+      finally:
+        collect.MAX_SESSION_FILE_BYTES = old_limit
+
+    self.assertEqual(stats["todayTotalTokens"], 1050)
 
 
 if __name__ == "__main__":
