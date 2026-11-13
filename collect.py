@@ -6,6 +6,7 @@ This writes the same record contract for Grok from:
 
 - ~/.grok/sessions/**/updates.jsonl  (per-turn token usage, once a turn finishes)
 - ~/.grok/logs/unified.jsonl  (tokens already spent on a turn that is still open)
+- ~/.hermes/state.db and each profile state.db (Grok tokens spent in Hermes, by the day the session ran)
 - https://cli-chat-proxy.grok.com/v1/billing?format=credits  (one combined weekly pool, or the older per-product pools)
 - https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig  (Grok Chat and Grok Voice on a split plan)
 - Grok Bot's Cursor sand session (its own meter, only on a split plan)
@@ -25,6 +26,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import stat
 import struct
 import subprocess
@@ -1846,11 +1848,132 @@ def collect_limits(token: str, expires_at: str, force: bool) -> dict[str, Any]:
 # -------------------------------------------------------------------- record
 
 
+def hermes_state_dbs() -> list[tuple[str, Path]]:
+  """Default Hermes home plus each profile. Missing databases are skipped."""
+  home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+  found: list[tuple[str, Path]] = []
+  default = home / "state.db"
+  if default.is_file():
+    found.append(("default", default))
+  profiles = home / "profiles"
+  if profiles.is_dir():
+    for path in sorted(profiles.glob("*/state.db")):
+      if path.is_file():
+        found.append((path.parent.name, path))
+  return found
+
+
+def hermes_row_total(inp: Any, out: Any, cache_read: Any, cache_write: Any) -> int:
+  """Input, output, and cache. Reasoning is already inside output on this install."""
+  return number(inp) + number(out) + number(cache_read) + number(cache_write)
+
+
+def read_hermes_usage_rows(databases: list[tuple[str, Path]] | None = None) -> list[dict[str, Any]]:
+  """One row per Hermes session and model. A locked or unreadable database is skipped."""
+  rows: list[dict[str, Any]] = []
+  for name, path in databases if databases is not None else hermes_state_dbs():
+    try:
+      con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+    except sqlite3.Error:
+      continue
+    try:
+      fetched = con.execute(
+        """
+        SELECT session_id, model, billing_provider, task, first_seen, last_seen,
+               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+        FROM session_model_usage
+        """
+      ).fetchall()
+    except sqlite3.Error:
+      continue
+    finally:
+      con.close()
+    for session_id, model, provider, task, first_seen, last_seen, inp, out, cache_read, cache_write in fetched:
+      total = hermes_row_total(inp, out, cache_read, cache_write)
+      if total <= 0 or not session_id:
+        continue
+      rows.append({
+        "key": f"{name}:{session_id}:{model}:{provider}:{task}",
+        "total": total,
+        "first_seen": first_seen,
+        "last_seen": last_seen,
+      })
+  return rows
+
+
+def load_hermes_ledger(path: Path | None = None) -> dict[str, int]:
+  target = cache_root() / "hermes-usage-ledger.json" if path is None else path
+  raw = read_regular_file(target, MAX_CACHE_FILE_BYTES)
+  if raw is None:
+    return {}
+  try:
+    data = json.loads(raw.decode("utf-8"))
+  except Exception:
+    return {}
+  totals = data.get("totals") if isinstance(data, dict) else None
+  if not isinstance(totals, dict):
+    return {}
+  return {str(key): number(value) for key, value in totals.items()}
+
+
+def save_hermes_ledger(totals: dict[str, int], path: Path | None = None) -> None:
+  target = cache_root() / "hermes-usage-ledger.json" if path is None else path
+  write_json(target, {"totals": totals})
+
+
+def add_hermes_usage(stats: dict[str, Any], rows: list[dict[str, Any]], ledger: dict[str, int]) -> dict[str, int]:
+  """Add Hermes tokens onto the day they were used.
+
+  A session that starts and ends on one day belongs on that day. A session that
+  spans days is remembered in the ledger: only tokens added since the last scan
+  land on the latest day. The first sight of a spanning session is not dumped
+  onto one bar. The published record is rebuilt from the Grok scan each time, so
+  a same-day total is added in full, not as a delta.
+  """
+  days = stats.get("recentDays")
+  if not isinstance(days, list):
+    return dict(ledger)
+  recent = {str(day.get("date")): day for day in days if isinstance(day, dict)}
+  today = local_date_string()
+  updated = dict(ledger)
+  hermes_lifetime = 0
+  for row in rows:
+    total = number(row.get("total"))
+    if total <= 0:
+      continue
+    hermes_lifetime += total
+    key = str(row.get("key") or "")
+    first_day = local_date_from_timestamp(row.get("first_seen"))
+    last_day = local_date_from_timestamp(row.get("last_seen"))
+    previous = ledger.get(key)
+    if first_day == last_day:
+      day = recent.get(last_day)
+      if day is not None:
+        day["messageCount"] = number(day.get("messageCount")) + total
+      if last_day == today:
+        stats["todayTotalTokens"] = number(stats.get("todayTotalTokens")) + total
+    elif previous is not None:
+      delta = max(0, total - number(previous))
+      day_key = last_day if last_day in recent else today
+      day = recent.get(day_key)
+      if delta and day is not None:
+        day["messageCount"] = number(day.get("messageCount")) + delta
+      if delta and day_key == today:
+        stats["todayTotalTokens"] = number(stats.get("todayTotalTokens")) + delta
+    if key:
+      updated[key] = total
+  stats["lifetimeTotalTokens"] = number(stats.get("lifetimeTotalTokens")) + hermes_lifetime
+  return updated
+
+
 def build_record(force: bool, limits_only: bool, cache_seconds: float) -> dict[str, Any]:
   home = grok_home()
   scan_age = 0 if force else (900 if limits_only else cache_seconds)
   stats = dict(cached_scan(home / "sessions", scan_age))
   stats["lifetimeTotalTokens"] = lifetime_tokens(stats)
+  ledger = load_hermes_ledger()
+  ledger = add_hermes_usage(stats, read_hermes_usage_rows(), ledger)
+  save_hermes_ledger(ledger)
   token, expires_at = ensure_fresh_auth(home / "auth.json")
   limits = collect_limits(token, expires_at, force)
 

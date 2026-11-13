@@ -649,8 +649,10 @@ class TokenStats(unittest.TestCase):
       }), encoding="utf-8")
       old_home = os.environ.get("GROK_HOME")
       old_cache = os.environ.get("XDG_CACHE_HOME")
+      old_hermes = os.environ.get("HERMES_HOME")
       os.environ["GROK_HOME"] = str(home)
       os.environ["XDG_CACHE_HOME"] = str(root / "cache")
+      os.environ["HERMES_HOME"] = str(root / "hermes")
       try:
         record = collect.build_record(False, False, 900)
       finally:
@@ -662,6 +664,10 @@ class TokenStats(unittest.TestCase):
           os.environ.pop("XDG_CACHE_HOME", None)
         else:
           os.environ["XDG_CACHE_HOME"] = old_cache
+        if old_hermes is None:
+          os.environ.pop("HERMES_HOME", None)
+        else:
+          os.environ["HERMES_HOME"] = old_hermes
 
     self.assertEqual(record["lifetimeTotalTokens"], 110)
     self.assertEqual(record["tierLabel"], "110 today · 110 this week · 110 lifetime")
@@ -805,6 +811,34 @@ class TokenStats(unittest.TestCase):
         collect.MAX_SESSION_FILE_BYTES = old_limit
 
     self.assertEqual(stats["todayTotalTokens"], 1050)
+
+  def test_hermes_same_day_fills_that_day_and_a_span_does_not_dump(self) -> None:
+    today = collect.local_date_string()
+    noon = dt.datetime.now().replace(hour=12, minute=0, second=0, microsecond=0).timestamp()
+    yesterday = noon - 86400
+    stats = {
+      "recentDays": [
+        {"date": collect.date_string(dt.date.fromtimestamp(yesterday)), "messageCount": 0},
+        {"date": today, "messageCount": 10},
+      ],
+      "todayTotalTokens": 10,
+      "lifetimeTotalTokens": 10,
+    }
+    same_day = {"key": "default:short:grok-4.7", "total": 100, "first_seen": noon, "last_seen": noon + 60}
+    spanning = {"key": "default:long:grok-4.7", "total": 5000, "first_seen": yesterday, "last_seen": noon}
+
+    ledger = collect.add_hermes_usage(stats, [same_day, spanning], {})
+
+    self.assertEqual(stats["recentDays"][1]["messageCount"], 110)
+    self.assertEqual(stats["recentDays"][0]["messageCount"], 0)
+    self.assertEqual(stats["todayTotalTokens"], 110)
+    self.assertEqual(ledger["default:long:grok-4.7"], 5000)
+
+    spanning["total"] = 5400
+    ledger = collect.add_hermes_usage(stats, [same_day, spanning], ledger)
+
+    self.assertEqual(stats["recentDays"][1]["messageCount"], 610)
+    self.assertEqual(stats["todayTotalTokens"], 610)
 
 
 if __name__ == "__main__":
